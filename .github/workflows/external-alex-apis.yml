@@ -1,0 +1,61 @@
+name: AIVS Alex and CAPITAP API guards
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  route-guards:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Record runner public IPv4
+        shell: bash
+        run: |
+          set -euo pipefail
+          ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org)"
+          printf 'source_ipv4=%s\n' "$ip"
+          printf 'utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      - name: Check only approved signed-out GET routes
+        shell: bash
+        env:
+          TARGET_ROUTES: ${{ secrets.TARGET_ROUTES_ALEX_APIS }}
+        run: |
+          set -euo pipefail
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          count=0
+          while IFS='|' read -r host path mode; do
+            [[ -z "$host" ]] && continue
+            [[ "$host" =~ ^[a-z0-9.-]+$ ]] || exit 2
+            [[ "$path" =~ ^/[a-zA-Z0-9/_-]*$ ]] || exit 2
+            case "$mode" in
+              access|bootstrap|session|deny|deny-makeat) ;;
+              *) exit 2 ;;
+            esac
+            count=$((count + 1))
+            args=(-4s --connect-timeout 5 --max-time 12 --max-filesize 65536
+              --max-redirs 0 --dump-header "$tmpdir/headers" --output "$tmpdir/body"
+              --write-out '%{http_code}'
+              --user-agent 'AIVS-authorized-boundary-check/2026-10-14')
+            if [[ "$mode" == bootstrap || "$mode" == deny-makeat || ( "$mode" == session && "$host" == makeat.co.uk ) ]]; then
+              args+=(--header 'X-Makeat-Client: 1')
+            fi
+            status="$(curl "${args[@]}" "https://${host}${path}")" || status=ERR
+            guard=review
+            case "$mode" in
+              access)
+                if grep -qi '^location:.*cloudflareaccess\.com' "$tmpdir/headers"; then guard=expected; fi ;;
+              deny|deny-makeat)
+                if [[ "$status" == 401 || "$status" == 403 ]]; then guard=expected; fi ;;
+              bootstrap)
+                if [[ "$status" == 200 ]] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(not (d.get("setupRequired") is False and d.get("bootstrapAllowed") is False))' "$tmpdir/body"; then guard=expected; fi ;;
+              session)
+                if [[ "$status" == 200 ]] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(not (d.get("authenticated") is False))' "$tmpdir/body"; then guard=expected; fi ;;
+            esac
+            printf '%02d status=%s guard=%s\n' "$count" "$status" "$guard"
+            sleep 1
+          done <<< "$TARGET_ROUTES"
+          [[ "$count" -eq 6 ]]
