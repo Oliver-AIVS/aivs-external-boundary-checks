@@ -1,0 +1,92 @@
+name: AIVS RAIA synthetic object ID boundary
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      BUNDLE: ${{ secrets.RAIA_SYNTHETIC_THREAD_BOUNDARY }}
+    steps:
+      - name: Check foreign thread IDs from outside AIVS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+          from datetime import datetime, timezone
+          BASE='https://raia.agiily.co.uk'
+          UA='AIVS-authorized-synthetic-boundary-test/2026-10-14'
+          bundle=json.loads(os.environ['BUNDLE'])
+          sessions=bundle['sessions']; threads=bundle['threads']
+          if sorted(sessions)!=['A-member','A-owner','B-member','B-owner'] or sorted(threads)!=['A','B']:
+              raise SystemExit('Synthetic sessions or IDs incomplete')
+          if threads['A']==threads['B']:
+              raise SystemExit('Fixture IDs must differ')
+          def call(method,path,token,payload=None):
+              headers={'Accept':'application/json','User-Agent':UA,
+                       'Cookie':'__Host-raia_session='+token}
+              if payload is not None:
+                  headers.update({'Content-Type':'application/json','Origin':BASE,
+                                  'Sec-Fetch-Site':'same-origin'})
+              elif method!='GET':
+                  headers.update({'Origin':BASE,'Sec-Fetch-Site':'same-origin'})
+              req=urllib.request.Request(BASE+path,
+                  data=None if payload is None else json.dumps(payload).encode(),
+                  headers=headers,method=method)
+              try:
+                  with urllib.request.urlopen(req,timeout=20) as r:
+                      return r.status,r.read(1000000)
+              except urllib.error.HTTPError as e:
+                  return e.code,e.read(1000000)
+          with urllib.request.urlopen('https://api.ipify.org',timeout=10) as r:
+              print('source_ipv4='+r.read(100).decode())
+          print('utc='+datetime.now(timezone.utc).isoformat(timespec='seconds'))
+          failures=0
+          for alias in ('A-owner','A-member','B-owner','B-member'):
+              side,role=alias.split('-')
+              token=sessions[alias]
+              other='B' if side=='A' else 'A'
+              foreign_id=threads[other]
+              for method,body in (('GET',None),('PATCH',{'title':'foreign probe'}),('DELETE',None)):
+                  status,_=call(method,'/api/assistant/threads/'+foreign_id,token,body)
+                  print(f'{alias} {method} /api/assistant/threads/[foreign-workspace-id] HTTP {status}')
+                  failures+=status!=404
+              if role=='member':
+                  own_workspace_owner_id=threads[side]
+                  for method,body in (('GET',None),('PATCH',{'title':'member probe'}),('DELETE',None)):
+                      status,_=call(method,'/api/assistant/threads/'+own_workspace_owner_id,token,body)
+                      print(f'{alias} {method} /api/assistant/threads/[same-workspace-owner-id] HTTP {status}')
+                      failures+=status!=404
+              status,body=call('GET','/api/assistant/threads',token)
+              data=json.loads(body) if status==200 else {}
+              listed=data.get('threads',[])
+              expected=[threads[side]] if role=='owner' else []
+              scoped=status==200 and isinstance(listed,list) and [row.get('id') for row in listed]==expected
+              print(f'{alias} GET /api/assistant/threads HTTP {status} own_list_only={int(scoped)}')
+              failures+=not scoped
+          for side in ('A','B'):
+              token=sessions[side+'-owner']; thread_id=threads[side]
+              path='/api/assistant/threads/'+thread_id
+              status,body=call('GET',path,token)
+              thread=json.loads(body).get('thread',{}) if status==200 else {}
+              original=status==200 and thread.get('id')==thread_id and thread.get('title')=='open my notifications'
+              print(f'{side}-owner GET /api/assistant/threads/[own-id] HTTP {status} unchanged_after_foreign_writes={int(original)}')
+              failures+=not original
+              if not original: continue
+              title='AIVS synthetic boundary '+side
+              status,_=call('PATCH',path,token,{'title':title})
+              print(f'{side}-owner PATCH /api/assistant/threads/[own-id] HTTP {status}')
+              failures+=status!=200
+              status,body=call('GET',path,token)
+              thread=json.loads(body).get('thread',{}) if status==200 else {}
+              renamed=status==200 and thread.get('title')==title
+              print(f'{side}-owner GET /api/assistant/threads/[own-id] HTTP {status} own_write_confirmed={int(renamed)}')
+              failures+=not renamed
+          print(f'object_boundary_failures={failures}')
+          sys.exit(1 if failures else 0)
+          PY
