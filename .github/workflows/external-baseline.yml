@@ -1,0 +1,39 @@
+name: AIVS external boundary baseline
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  signed-out-roots:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Record runner public IPv4
+        shell: bash
+        run: |
+          set -euo pipefail
+          ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org)"
+          printf 'source_ipv4=%s\n' "$ip"
+          printf 'utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      - name: Check approved public roots without credentials
+        shell: bash
+        env:
+          TARGET_HOSTS: ${{ secrets.TARGET_HOSTS }}
+        run: |
+          set -euo pipefail
+          count=0
+          while IFS= read -r host; do
+            [[ -z "$host" ]] && continue
+            [[ "$host" =~ ^[a-z0-9.-]+$ ]] || exit 2
+            count=$((count + 1))
+            status="$(curl -4s --connect-timeout 5 --max-time 12 \
+              --max-redirs 0 --output /dev/null --write-out '%{http_code}' \
+              --user-agent 'AIVS-authorized-boundary-check/2026-10-14' \
+              "https://${host}/")" || status=ERR
+            printf '%02d status=%s\n' "$count" "$status"
+            sleep 1
+          done <<< "$TARGET_HOSTS"
+          [[ "$count" -eq 20 ]]
