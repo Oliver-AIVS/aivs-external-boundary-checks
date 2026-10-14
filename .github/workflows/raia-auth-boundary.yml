@@ -1,0 +1,114 @@
+name: AIVS RAIA synthetic tenant and role boundary
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      SESSION_BUNDLE: ${{ secrets.RAIA_SYNTHETIC_SESSION_BUNDLE }}
+    steps:
+      - name: Check four MFA-complete synthetic sessions from outside AIVS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.error, urllib.parse, urllib.request
+          BASE = 'https://raia.agiily.co.uk'
+          IDS = {'A':'3d958956-55ad-474a-ba95-e9d0c65ee20b',
+                 'B':'4af83e58-7359-42cd-885a-10ccf5e9c4d2'}
+          UA = 'AIVS-authorized-synthetic-boundary-test/2026-10-14'
+          bundle = json.loads(os.environ['SESSION_BUNDLE'])
+          if sorted(bundle) != ['A-member','A-owner','B-member','B-owner']:
+              raise SystemExit('Missing synthetic sessions')
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, newurl):
+                  return None
+          opener = urllib.request.build_opener(NoRedirect)
+          def call(method,path,token,payload=None,web=False):
+              headers={'User-Agent':UA,'Accept':'text/html' if web else 'application/json'}
+              if web: headers['Cookie']='__Host-raia_session='+token
+              else: headers['Authorization']='Bearer '+token
+              if payload is not None: headers['Content-Type']='application/json'
+              req=urllib.request.Request(BASE+path,
+                  data=None if payload is None else json.dumps(payload).encode(),
+                  headers=headers,method=method)
+              try:
+                  with opener.open(req,timeout=20) as r: return r.status,r.headers,r.read(1000000)
+              except urllib.error.HTTPError as e: return e.code,e.headers,e.read(1000000)
+          with urllib.request.urlopen('https://api.ipify.org',timeout=10) as r:
+              print('source_ipv4='+r.read(100).decode())
+          from datetime import datetime, timezone
+          print('utc='+datetime.now(timezone.utc).isoformat(timespec='seconds'))
+          failures=0
+          for alias in ('A-owner','A-member','B-owner','B-member'):
+              side,role=alias.split('-')
+              token=bundle[alias]
+              own=IDS[side]; foreign=IDS['B' if side=='A' else 'A']
+              status,_,body=call('GET','/api/v1/session',token)
+              session=json.loads(body) if status==200 else {}
+              active=session.get('activeWorkspace') or {}
+              offered=session.get('workspaces') or []
+              own_only=(status==200 and active.get('id')==own and active.get('role')==role
+                        and len(offered)==1 and offered[0].get('id')==own
+                        and offered[0].get('role')==role
+                        and session.get('mfa',{}).get('satisfied') is True)
+              print(f'{alias} GET /api/v1/session {status} own_only={int(own_only)}')
+              failures+=not own_only
+              if not own_only: continue
+              status,_,_=call('POST','/api/v1/session/workspace',token,{'workspaceId':foreign})
+              print(f'{alias} POST /api/v1/session/workspace foreign {status}')
+              failures+=status!=404
+              status,_,body=call('GET','/api/v1/session',token)
+              unchanged=(status==200 and json.loads(body).get('activeWorkspace',{}).get('id')==own)
+              print(f'{alias} GET /api/v1/session after-denial {status} unchanged={int(unchanged)}')
+              failures+=not unchanged
+              status,_,body=call('GET','/api/v1/requests?scope=active',token)
+              listed=json.loads(body) if status==200 else {}
+              rows=sum(len(listed.get(k,[])) for k in ('recent','mine','pool'))
+              projection=listed.get('kind')
+              good=status==200 and projection==('admin' if role=='owner' else 'member') and rows==0
+              print(f'{alias} GET /api/v1/requests?scope=active {status} projection_ok={int(good)} rows={rows}')
+              failures+=not good
+              status,headers,body=call('GET','/admin/people',token,web=True)
+              html=body.decode('utf-8','replace')
+              if role=='owner':
+                  own_emails=all(f'raia-pentest-{side.lower()}{suffix}@example.invalid' in html
+                                 for suffix in ('','-member'))
+                  other='b' if side=='A' else 'a'
+                  foreign_emails=any(f'raia-pentest-{other}{suffix}@example.invalid' in html
+                                     for suffix in ('','-member'))
+                  allowed=status==200 and own_emails and not foreign_emails
+                  print(f'{alias} GET /admin/people {status} tenant_read_ok={int(allowed)}')
+                  failures+=not allowed
+                  status,_,body=call('GET','/admin/people?workspaceId='+foreign,token,web=True)
+                  html=body.decode('utf-8','replace')
+                  foreign_emails=any(f'raia-pentest-{other}{suffix}@example.invalid' in html
+                                     for suffix in ('','-member'))
+                  allowed=status==200 and not foreign_emails
+                  print(f'{alias} GET /admin/people?workspaceId=foreign {status} tenant_read_ok={int(allowed)}')
+                  failures+=not allowed
+              else:
+                  redirected=(status in (302,303,307,308) and
+                      urllib.parse.urlparse(headers.get('Location','')).path=='/app') or (
+                      status==200 and 'NEXT_REDIRECT' in html and '/app' in html)
+                  no_admin='Invitation tracker' not in html and 'Send invitation' not in html
+                  print(f'{alias} GET /admin/people {status} denied={int(redirected and no_admin)}')
+                  failures+=not (redirected and no_admin)
+              status,headers,body=call('GET','/admin/audit',token,web=True)
+              html=body.decode('utf-8','replace')
+              if role=='owner': allowed=status==200
+              else:
+                  redirected=(status in (302,303,307,308) and
+                      urllib.parse.urlparse(headers.get('Location','')).path=='/app') or (
+                      status==200 and 'NEXT_REDIRECT' in html and '/app' in html)
+                  allowed=redirected and 'Export this view' not in html and 'Audit filters' not in html
+              print(f'{alias} GET /admin/audit {status} role_guard_ok={int(allowed)}')
+              failures+=not allowed
+          print(f'boundary_failures={failures}')
+          sys.exit(1 if failures else 0)
+          PY
